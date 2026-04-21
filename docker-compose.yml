@@ -1,0 +1,103 @@
+version: '3.9'
+
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-fre}:${POSTGRES_PASSWORD:-fre_secret}@postgres:5432/${POSTGRES_DB:-failure_recovery}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  AUTH_ENABLED: ${AUTH_ENABLED:-true}
+  DEFAULT_TENANT_SLUG: ${DEFAULT_TENANT_SLUG:-default}
+  WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-5}
+  WEBHOOK_TIMEOUT_MS: ${WEBHOOK_TIMEOUT_MS:-5000}
+  WEBHOOK_MAX_ATTEMPTS: ${WEBHOOK_MAX_ATTEMPTS:-5}
+  IDEMPOTENCY_TTL_HOURS: ${IDEMPOTENCY_TTL_HOURS:-24}
+  RATE_LIMIT_TTL_MS: ${RATE_LIMIT_TTL_MS:-60000}
+  RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-120}
+  CORS_ORIGIN: ${CORS_ORIGIN:-*}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: fre-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fre}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fre_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-failure_recovery}
+    ports:
+      - '5433:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-fre}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: fre-redis
+    restart: unless-stopped
+    ports:
+      - '6380:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fre-backend
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      PORT: 3001
+    ports:
+      - '3001:3001'
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://localhost:3001/healthz']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: fre-worker
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fre-frontend
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
+      NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - '3010:3000'
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:

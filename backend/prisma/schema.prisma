@@ -1,0 +1,339 @@
+// Failure Recovery Engine — production schema (v2)
+// Adds: tenancy, idempotency, webhooks, dispatch outbox, additional indexes.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x", "linux-musl-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  RETRYING
+  CANCELLED
+}
+
+enum StepStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  SKIPPED
+  COMPENSATED
+}
+
+enum StepType {
+  RESERVE_INVENTORY
+  PROCESS_PAYMENT
+  SEND_EMAIL
+  GENERATE_INVOICE
+  SYNC_CRM
+  NOTIFY_WEBHOOK
+  CUSTOM
+}
+
+enum FailureType {
+  TIMEOUT
+  NETWORK_ERROR
+  EXTERNAL_SERVICE_FAILURE
+  VALIDATION_ERROR
+  UNKNOWN
+}
+
+enum RecoveryStrategy {
+  RETRY
+  RETRY_WITH_DELAY
+  FALLBACK
+  SKIP
+  COMPENSATE
+  ESCALATE
+  DEAD_LETTER
+}
+
+enum ServiceStatus {
+  HEALTHY
+  DEGRADED
+  DOWN
+}
+
+enum AuditAction {
+  JOB_CREATED
+  JOB_STARTED
+  JOB_COMPLETED
+  JOB_FAILED
+  JOB_CANCELLED
+  STEP_STARTED
+  STEP_COMPLETED
+  STEP_FAILED
+  STEP_SKIPPED
+  STEP_COMPENSATED
+  FAILURE_DETECTED
+  RECOVERY_STARTED
+  RECOVERY_SUCCEEDED
+  RECOVERY_FAILED
+  ESCALATED
+  DEAD_LETTERED
+  MANUAL_RETRY
+  WEBHOOK_DELIVERED
+  WEBHOOK_FAILED
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  DELIVERED
+  FAILED
+}
+
+// ─── Tenancy & Auth ──────────────────────────────────────────────────────────
+
+model Tenant {
+  id          String           @id @default(cuid())
+  name        String
+  slug        String           @unique
+  rateLimit   Int              @default(120)
+  apiKeys     ApiKey[]
+  workflows   Workflow[]
+  jobs        Job[]
+  auditLogs   AuditLog[]
+  webhooks    WebhookDelivery[]
+  idemKeys    IdempotencyKey[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@map("tenants")
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  tenantId   String
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  keyHash    String    @unique
+  prefix     String
+  label      String
+  scopes     String[]  @default([])
+  revokedAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+model IdempotencyKey {
+  id             String   @id @default(cuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  key            String
+  requestHash    String
+  responseStatus Int
+  responseBody   Json
+  jobId          String?
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  @@unique([tenantId, key])
+  @@index([expiresAt])
+  @@map("idempotency_keys")
+}
+
+// ─── Domain Models ───────────────────────────────────────────────────────────
+
+model Workflow {
+  id          String         @id @default(cuid())
+  tenantId    String
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  steps       WorkflowStep[]
+  jobs        Job[]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("workflows")
+}
+
+model WorkflowStep {
+  id             String          @id @default(cuid())
+  workflowId     String
+  workflow       Workflow        @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  name           String
+  type           StepType
+  order          Int
+  config         Json?
+  isCritical     Boolean         @default(true)
+  recoveryPolicy RecoveryPolicy?
+  jobSteps       JobStep[]
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@unique([workflowId, order])
+  @@index([workflowId])
+  @@map("workflow_steps")
+}
+
+model Job {
+  id          String            @id @default(cuid())
+  tenantId    String
+  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  workflowId  String
+  workflow    Workflow          @relation(fields: [workflowId], references: [id])
+  status      JobStatus         @default(PENDING)
+  payload     Json?
+  context     Json?
+  bullJobId   String?           @unique
+  callbackUrl String?
+  steps       JobStep[]
+  incidents   Incident[]
+  auditLogs   AuditLog[]
+  webhooks    WebhookDelivery[]
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([workflowId])
+  @@index([tenantId, status])
+  @@index([createdAt])
+  @@map("jobs")
+}
+
+model JobStep {
+  id               String            @id @default(cuid())
+  jobId            String
+  job              Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  workflowStepId   String
+  workflowStep     WorkflowStep      @relation(fields: [workflowStepId], references: [id])
+  status           StepStatus        @default(PENDING)
+  attempts         Int               @default(0)
+  error            String?
+  failureType      FailureType?
+  result           Json?
+  startedAt        DateTime?
+  completedAt      DateTime?
+  incidents        Incident[]
+  recoveryAttempts RecoveryAttempt[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@index([jobId])
+  @@index([status])
+  @@map("job_steps")
+}
+
+model RecoveryPolicy {
+  id                String           @id @default(cuid())
+  workflowStepId    String           @unique
+  workflowStep      WorkflowStep     @relation(fields: [workflowStepId], references: [id], onDelete: Cascade)
+  strategy          RecoveryStrategy @default(RETRY)
+  maxRetries        Int              @default(3)
+  retryDelayMs      Int              @default(1000)
+  backoffMultiplier Float            @default(2.0)
+  fallbackService   String?
+  timeoutMs         Int              @default(30000)
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  @@map("recovery_policies")
+}
+
+model Incident {
+  id               String            @id @default(cuid())
+  jobId            String
+  job              Job               @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobStepId        String
+  jobStep          JobStep           @relation(fields: [jobStepId], references: [id], onDelete: Cascade)
+  failureType      FailureType
+  message          String
+  resolved         Boolean           @default(false)
+  escalated        Boolean           @default(false)
+  retryCount       Int               @default(0)
+  recoveryAttempts RecoveryAttempt[]
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@index([jobId])
+  @@index([resolved])
+  @@map("incidents")
+}
+
+model RecoveryAttempt {
+  id         String           @id @default(cuid())
+  incidentId String
+  incident   Incident         @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  jobStepId  String
+  jobStep    JobStep          @relation(fields: [jobStepId], references: [id], onDelete: Cascade)
+  strategy   RecoveryStrategy
+  success    Boolean
+  error      String?
+  durationMs Int?
+  metadata   Json?
+  createdAt  DateTime         @default(now())
+
+  @@index([incidentId])
+  @@map("recovery_attempts")
+}
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  tenantId  String?
+  tenant    Tenant?     @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  jobId     String?
+  job       Job?        @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  action    AuditAction
+  message   String
+  metadata  Json?
+  createdAt DateTime    @default(now())
+
+  @@index([tenantId])
+  @@index([jobId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model ServiceHealth {
+  id        String        @id @default(cuid())
+  name      String        @unique
+  status    ServiceStatus @default(HEALTHY)
+  metadata  Json?
+  updatedAt DateTime      @updatedAt
+
+  @@map("service_health")
+}
+
+model WebhookDelivery {
+  id           String                @id @default(cuid())
+  tenantId     String
+  tenant       Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  jobId        String
+  job          Job                   @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  url          String
+  event        String
+  payload      Json
+  signature    String
+  status       WebhookDeliveryStatus @default(PENDING)
+  attempts     Int                   @default(0)
+  lastError    String?
+  responseCode Int?
+  deliveredAt  DateTime?
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+
+  @@index([tenantId])
+  @@index([jobId])
+  @@index([status])
+  @@map("webhook_deliveries")
+}

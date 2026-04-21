@@ -1,0 +1,35 @@
+// Production overlay — usage:
+//   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+version: '3.9'
+
+services:
+  backend:
+    restart: always
+    deploy:
+      replicas: 2
+      restart_policy: { condition: on-failure, max_attempts: 5 }
+    logging:
+      driver: json-file
+      options: { max-size: '10m', max-file: '5' }
+
+  worker:
+    restart: always
+    deploy:
+      replicas: 2
+      restart_policy: { condition: on-failure, max_attempts: 5 }
+    logging:
+      driver: json-file
+      options: { max-size: '10m', max-file: '5' }
+
+  postgres:
+    restart: always
+    command:
+      - 'postgres'
+      - '-c'
+      - 'max_connections=200'
+      - '-c'
+      - 'shared_buffers=256MB'
+
+  redis:
+    restart: always
+    command: ['redis-server', '--maxmemory', '256mb', '--maxmemory-policy', 'allkeys-lru']
