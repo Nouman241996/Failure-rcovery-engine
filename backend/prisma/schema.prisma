@@ -25,6 +25,7 @@ enum JobStatus {
 enum StepStatus {
   PENDING
   RUNNING
+  WAITING_APPROVAL
   COMPLETED
   FAILED
   SKIPPED
@@ -39,6 +40,13 @@ enum StepType {
   SYNC_CRM
   NOTIFY_WEBHOOK
   CUSTOM
+
+  // AI-agent primitives
+  LLM_CALL
+  TOOL_INVOKE
+  HUMAN_APPROVAL
+  EMBED
+  VECTOR_SEARCH
 }
 
 enum FailureType {
@@ -57,6 +65,11 @@ enum RecoveryStrategy {
   COMPENSATE
   ESCALATE
   DEAD_LETTER
+
+  // AI-agent strategies
+  SWITCH_MODEL
+  REDUCE_CONTEXT
+  PAUSE_FOR_HUMAN
 }
 
 enum ServiceStatus {
@@ -85,6 +98,13 @@ enum AuditAction {
   MANUAL_RETRY
   WEBHOOK_DELIVERED
   WEBHOOK_FAILED
+
+  // AI-agent events
+  APPROVAL_REQUESTED
+  APPROVAL_GRANTED
+  APPROVAL_DENIED
+  MODEL_SWITCHED
+  CONTEXT_REDUCED
 }
 
 enum WebhookDeliveryStatus {
@@ -223,6 +243,18 @@ model JobStep {
   result           Json?
   startedAt        DateTime?
   completedAt      DateTime?
+
+  // AI-agent telemetry — populated by LLM_CALL/TOOL_INVOKE handlers.
+  model            String?
+  promptTokens     Int?
+  completionTokens Int?
+  costUsd          Decimal?          @db.Decimal(12, 6)
+
+  // HUMAN_APPROVAL coordination.
+  approvalToken    String?           @unique
+  approvedAt       DateTime?
+  approvedBy       String?
+
   incidents        Incident[]
   recoveryAttempts RecoveryAttempt[]
   createdAt        DateTime          @default(now())

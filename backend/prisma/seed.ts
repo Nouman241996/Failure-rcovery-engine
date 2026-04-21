@@ -55,6 +55,7 @@ async function main() {
 
   await seedOrderWorkflow(tenant.id);
   await seedSubscriptionWorkflow(tenant.id);
+  await seedAiSummaryWorkflow(tenant.id);
 
   console.log('🌱 Done.');
 }
@@ -192,6 +193,59 @@ async function seedSubscriptionWorkflow(tenantId: string) {
     },
   });
   console.log('  • workflow "Subscription Renewal" seeded');
+}
+
+async function seedAiSummaryWorkflow(tenantId: string) {
+  const existing = await prisma.workflow.findUnique({
+    where: { tenantId_name: { tenantId, name: 'AI Document Summary' } },
+  });
+  if (existing) return console.log('  • workflow "AI Document Summary" exists');
+
+  await prisma.workflow.create({
+    data: {
+      tenantId,
+      name: 'AI Document Summary',
+      description:
+        'Summarize a document via LLM_CALL; demonstrate SWITCH_MODEL recovery from a flaky primary model.',
+      steps: {
+        create: [
+          {
+            name: 'Summarize',
+            type: StepType.LLM_CALL,
+            order: 1,
+            isCritical: true,
+            config: {
+              provider: 'mock',
+              model: 'mock-flaky',
+              systemPrompt: 'You are a concise technical summarizer.',
+              userPromptTemplate:
+                'Summarize the following in one paragraph:\n\n{{payload.text}}',
+              temperature: 0.2,
+              maxTokens: 256,
+            },
+            recoveryPolicy: {
+              create: {
+                strategy: RecoveryStrategy.SWITCH_MODEL,
+                maxRetries: 2,
+                retryDelayMs: 500,
+                fallbackService: 'mock-small',
+              },
+            },
+          },
+          {
+            name: 'Notify Result',
+            type: StepType.NOTIFY_WEBHOOK,
+            order: 2,
+            isCritical: false,
+            recoveryPolicy: {
+              create: { strategy: RecoveryStrategy.SKIP, maxRetries: 1 },
+            },
+          },
+        ],
+      },
+    },
+  });
+  console.log('  • workflow "AI Document Summary" seeded');
 }
 
 main()

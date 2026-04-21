@@ -14,6 +14,9 @@ export const METRIC_NAMES = {
   webhookDeliveries: 'fre_webhook_deliveries_total',
   jobDuration: 'fre_job_duration_seconds',
   inFlightJobs: 'fre_inflight_jobs',
+  llmTokens: 'fre_llm_tokens_total',
+  llmCost: 'fre_llm_cost_usd_total',
+  modelSwitches: 'fre_model_switches_total',
 } as const;
 
 const metricProviders = [
@@ -51,6 +54,21 @@ const metricProviders = [
   makeGaugeProvider({
     name: METRIC_NAMES.inFlightJobs,
     help: 'Currently executing jobs',
+  }),
+  makeCounterProvider({
+    name: METRIC_NAMES.llmTokens,
+    help: 'LLM tokens consumed',
+    labelNames: ['tenant', 'provider', 'model', 'kind'],
+  }),
+  makeCounterProvider({
+    name: METRIC_NAMES.llmCost,
+    help: 'LLM cost in USD',
+    labelNames: ['tenant', 'provider', 'model'],
+  }),
+  makeCounterProvider({
+    name: METRIC_NAMES.modelSwitches,
+    help: 'SWITCH_MODEL recovery attempts',
+    labelNames: ['tenant', 'from_model', 'to_model'],
   }),
 ];
 

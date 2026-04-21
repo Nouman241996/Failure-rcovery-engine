@@ -12,6 +12,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { calcBackoff, simulateStepExecution } from './recovery.utils';
 import { METRIC_NAMES } from '../../common/metrics/metrics.module';
+import type { RecoveryHint } from '../workers/handlers/step-handler.interface';
 
 export interface StepExecutionContext {
   jobId: string;
@@ -32,6 +33,12 @@ export interface RecoveryResult {
   strategy: RecoveryStrategy;
   result?: Record<string, unknown>;
   error?: string;
+  /**
+   * Optional non-terminal hint that influences the next attempt of the same
+   * step. Used by AI-agent strategies like SWITCH_MODEL and REDUCE_CONTEXT
+   * that don't execute the step themselves.
+   */
+  hint?: RecoveryHint;
 }
 
 @Injectable()
@@ -125,9 +132,68 @@ export class RecoveryService {
         return this.handleCompensate(ctx);
       case RecoveryStrategy.ESCALATE:
         return this.handleEscalate(ctx);
+      case RecoveryStrategy.SWITCH_MODEL:
+        return this.handleSwitchModel(ctx);
+      case RecoveryStrategy.REDUCE_CONTEXT:
+        return this.handleReduceContext(ctx);
+      case RecoveryStrategy.PAUSE_FOR_HUMAN:
+        return this.handlePauseForHuman(ctx);
       default:
         return Promise.resolve({ success: false, strategy, error: 'Unknown strategy' });
     }
+  }
+
+  // ── AI-agent recovery strategies ──────────────────────────────────────────
+
+  /**
+   * Ask the worker to retry the step with a different model. `policy.fallbackService`
+   * carries the next model id (we treat it as a model name for LLM_CALL steps).
+   * Returns success=false but attaches a `hint` so the outer retry loop picks it up.
+   */
+  private async handleSwitchModel(ctx: StepExecutionContext): Promise<RecoveryResult> {
+    const nextModel = ctx.policy?.fallbackService?.trim();
+    if (!nextModel) {
+      return {
+        success: false,
+        strategy: RecoveryStrategy.SWITCH_MODEL,
+        error: 'SWITCH_MODEL requires policy.fallbackService',
+      };
+    }
+    return {
+      success: false,
+      strategy: RecoveryStrategy.SWITCH_MODEL,
+      hint: { overrideModel: nextModel },
+    };
+  }
+
+  /** Trim the prompt on the next attempt — useful for context-length errors. */
+  private async handleReduceContext(ctx: StepExecutionContext): Promise<RecoveryResult> {
+    void ctx;
+    return {
+      success: false,
+      strategy: RecoveryStrategy.REDUCE_CONTEXT,
+      hint: { reduceContext: true },
+    };
+  }
+
+  /**
+   * Phase A: audit-only. A full implementation would suspend the job and
+   * expose a resume endpoint keyed by JobStep.approvalToken — that belongs
+   * in a dedicated PR because it changes JobStatus semantics.
+   */
+  private async handlePauseForHuman(ctx: StepExecutionContext): Promise<RecoveryResult> {
+    await this.audit.log({
+      tenantId: ctx.tenantId,
+      jobId: ctx.jobId,
+      action: AuditAction.APPROVAL_REQUESTED,
+      message: `Step "${ctx.stepName}" awaiting human approval`,
+      metadata: { stepType: ctx.stepType, attempt: ctx.attempt },
+    });
+    return {
+      success: false,
+      strategy: RecoveryStrategy.PAUSE_FOR_HUMAN,
+      error: 'Pause-for-human approval not yet implemented (Phase B)',
+    };
   }
 
   // ── Strategy handlers ─────────────────────────────────────────────────────

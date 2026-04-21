@@ -67,7 +67,7 @@ export async function simulateStepExecution(
     throw err;
   }
 
-  const failureRates: Record<StepType, number> = {
+  const failureRates: Partial<Record<StepType, number>> = {
     RESERVE_INVENTORY: attempt === 1 ? 0.3 : 0.1,
     PROCESS_PAYMENT: attempt === 1 ? 0.5 : 0.2,
     SEND_EMAIL: attempt === 1 ? 0.4 : 0.15,
@@ -77,10 +77,11 @@ export async function simulateStepExecution(
     CUSTOM: 0.1,
   };
 
+  const baseRate = failureRates[stepType] ?? 0.1;
   const rate =
     serviceStatus === 'DEGRADED'
-      ? Math.min(failureRates[stepType] * 2, 0.9)
-      : failureRates[stepType];
+      ? Math.min(baseRate * 2, 0.9)
+      : baseRate;
 
   if (Math.random() < rate) {
     const errorTypes = getErrorTypesForStep(stepType);
@@ -94,19 +95,26 @@ export async function simulateStepExecution(
 }
 
 function getServiceForStep(stepType: StepType): string {
-  return {
-    RESERVE_INVENTORY: 'inventory',
-    PROCESS_PAYMENT: 'payment',
-    SEND_EMAIL: 'email',
-    GENERATE_INVOICE: 'invoice',
-    SYNC_CRM: 'crm',
-    NOTIFY_WEBHOOK: 'webhook',
-    CUSTOM: 'custom',
-  }[stepType];
+  return (
+    {
+      RESERVE_INVENTORY: 'inventory',
+      PROCESS_PAYMENT: 'payment',
+      SEND_EMAIL: 'email',
+      GENERATE_INVOICE: 'invoice',
+      SYNC_CRM: 'crm',
+      NOTIFY_WEBHOOK: 'webhook',
+      CUSTOM: 'custom',
+      LLM_CALL: 'llm',
+      TOOL_INVOKE: 'tool',
+      HUMAN_APPROVAL: 'approval',
+      EMBED: 'embed',
+      VECTOR_SEARCH: 'vector',
+    } as Record<StepType, string>
+  )[stepType];
 }
 
 function getErrorTypesForStep(stepType: StepType): string[] {
-  const errMap: Record<StepType, string[]> = {
+  const errMap: Partial<Record<StepType, string[]>> = {
     PROCESS_PAYMENT: [
       'Payment gateway timeout',
       'Payment provider network error',

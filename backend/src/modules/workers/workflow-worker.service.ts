@@ -10,6 +10,7 @@ import {
   AuditAction,
   Job as JobModel,
   JobStatus,
+  Prisma,
   StepStatus,
 } from '@prisma/client';
 import { Job as BullJob, Worker } from 'bullmq';
@@ -23,21 +24,25 @@ import { QueueService, WorkflowJobData } from '../queue/queue.service';
 import { ServiceHealthService } from '../service-health/service-health.service';
 import { WebhookService, WebhookEvent } from '../webhooks/webhook.service';
 import { REDIS_CLIENT, QUEUE_NAMES } from '../queue/queue.constants';
-import { classifyFailure, simulateStepExecution } from '../recovery/recovery.utils';
+import { classifyFailure } from '../recovery/recovery.utils';
 import { METRIC_NAMES } from '../../common/metrics/metrics.module';
 import type { AppEnv } from '../../common/config/env';
+import { RecoveryHint, StepHandlerRegistry, StepTelemetry } from './handlers';
 
 /**
  * BullMQ-backed worker that drives a `Job` through its `WorkflowStep`s.
  *
+ * Per-step execution is delegated to the `StepHandlerRegistry` so new step
+ * types (LLM_CALL, TOOL_INVOKE, …) plug in without touching this class.
+ *
  * Flow per job:
  *   1. Mark `RUNNING`, emit `JOB_STARTED`.
- *   2. For each step (ordered by creation): run handler → on failure ask
- *      `RecoveryService` to apply the configured strategy → loop until the
- *      step succeeds, is skipped, or exhausts retries.
- *   3. If a critical step exhausts recovery, mark `FAILED`, dead-letter the
- *      job and stop. Otherwise mark `COMPLETED`.
- *   4. Dispatch a webhook on terminal status (best-effort, isolated).
+ *   2. For each step: look up the handler for the step's type, execute it,
+ *      persist any telemetry returned. On failure, consult `RecoveryService`
+ *      which may either resolve the step itself (FALLBACK/SKIP/…) or set a
+ *      `RecoveryHint` that influences the next attempt (SWITCH_MODEL, …).
+ *   3. If a critical step exhausts recovery, mark `FAILED` and dead-letter.
+ *   4. Dispatch a terminal-status webhook (best-effort, isolated).
  *
  * The worker is cooperative: it polls `Job.status` between steps to honour
  * cancellation requests issued via the API.
@@ -55,11 +60,15 @@ export class WorkflowWorker implements OnModuleInit, OnApplicationShutdown {
     private readonly queue: QueueService,
     private readonly serviceHealth: ServiceHealthService,
     private readonly webhooks: WebhookService,
+    private readonly handlers: StepHandlerRegistry,
     private readonly config: ConfigService<AppEnv, true>,
     @InjectMetric(METRIC_NAMES.jobsCompleted) private readonly completedCounter: Counter<string>,
     @InjectMetric(METRIC_NAMES.jobsFailed) private readonly failedCounter: Counter<string>,
     @InjectMetric(METRIC_NAMES.jobDuration) private readonly durationHist: Histogram<string>,
     @InjectMetric(METRIC_NAMES.inFlightJobs) private readonly inFlightGauge: Gauge<string>,
+    @InjectMetric(METRIC_NAMES.llmTokens) private readonly llmTokensCounter: Counter<string>,
+    @InjectMetric(METRIC_NAMES.llmCost) private readonly llmCostCounter: Counter<string>,
+    @InjectMetric(METRIC_NAMES.modelSwitches) private readonly modelSwitchCounter: Counter<string>,
   ) {}
 
   onModuleInit() {
@@ -119,9 +128,9 @@ export class WorkflowWorker implements OnModuleInit, OnApplicationShutdown {
     serviceStatuses: Record<string, string>,
   ): Promise<boolean> {
     let jobFailed = false;
+    const stepResults: Record<string, unknown> = {};
 
     for (const step of job.steps) {
-      // Cooperative cancellation check.
       const status = await this.currentStatus(job.id);
       if (status === JobStatus.CANCELLED) return false;
 
@@ -138,18 +147,21 @@ export class WorkflowWorker implements OnModuleInit, OnApplicationShutdown {
       });
 
       const maxAttempts = policy ? policy.maxRetries + 1 : 1;
-      const success = await this.executeStepWithRecovery({
+      const outcome = await this.executeStepWithRecovery({
         job,
         step,
         wfStep,
         policy,
         maxAttempts,
         serviceStatuses,
+        stepResults,
       });
 
-      if (success) continue;
+      if (outcome.success) {
+        if (outcome.result) stepResults[wfStep.name] = outcome.result;
+        continue;
+      }
 
-      // Step exhausted.
       if (wfStep.isCritical) {
         jobFailed = true;
         await this.prisma.job.update({
@@ -193,35 +205,59 @@ export class WorkflowWorker implements OnModuleInit, OnApplicationShutdown {
   }
 
   private async executeStepWithRecovery(args: {
-    job: { id: string; tenantId: string };
+    job: { id: string; tenantId: string; workflowId: string };
     step: { id: string };
-    wfStep: { id: string; name: string; type: import('@prisma/client').StepType };
+    wfStep: {
+      id: string;
+      name: string;
+      type: import('@prisma/client').StepType;
+      config: Prisma.JsonValue | null;
+    };
     policy: import('@prisma/client').RecoveryPolicy | null;
     maxAttempts: number;
     serviceStatuses: Record<string, string>;
-  }): Promise<boolean> {
-    const { job, step, wfStep, policy, maxAttempts, serviceStatuses } = args;
+    stepResults: Record<string, unknown>;
+  }): Promise<{ success: boolean; result?: Record<string, unknown> }> {
+    const { job, step, wfStep, policy, maxAttempts, serviceStatuses, stepResults } = args;
+    const handler = this.handlers.resolve(wfStep.type);
+    const payload = {
+      ...((await this.loadJobPayload(job.id)) ?? {}),
+      steps: stepResults,
+    };
+    const stepConfig = (wfStep.config ?? {}) as Record<string, unknown>;
+
+    let recoveryHint: RecoveryHint | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const result = await simulateStepExecution(wfStep.type, attempt, serviceStatuses);
-        await this.prisma.jobStep.update({
-          where: { id: step.id },
-          data: {
-            status: StepStatus.COMPLETED,
-            result: result as object,
-            completedAt: new Date(),
-            attempts: attempt,
-          },
+        const out = await handler.execute({
+          tenantId: job.tenantId,
+          jobId: job.id,
+          stepId: step.id,
+          stepType: wfStep.type,
+          stepName: wfStep.name,
+          attempt,
+          config: stepConfig,
+          payload,
+          serviceStatuses,
+          recoveryHint,
         });
+
+        await this.persistStepSuccess(step.id, attempt, out.result, out.telemetry);
+        this.recordLlmMetrics(job.tenantId, out.telemetry);
+
         await this.audit.log({
           tenantId: job.tenantId,
           jobId: job.id,
           action: AuditAction.STEP_COMPLETED,
           message: `Step "${wfStep.name}" completed (attempt ${attempt})`,
-          metadata: { stepType: wfStep.type, attempt },
+          metadata: {
+            stepType: wfStep.type,
+            attempt,
+            telemetry: out.telemetry ?? undefined,
+          },
         });
-        return true;
+        return { success: true, result: out.result };
       } catch (rawErr) {
         const err = rawErr instanceof Error ? rawErr : new Error(String(rawErr));
         const failureType = classifyFailure(err);
@@ -263,6 +299,7 @@ export class WorkflowWorker implements OnModuleInit, OnApplicationShutdown {
           serviceStatuses,
         });
 
+        // Terminal success inside recovery (e.g. FALLBACK succeeded).
         if (recovery.success) {
           const finalStatus =
             recovery.strategy === 'SKIP' ? StepStatus.SKIPPED : StepStatus.COMPLETED;
@@ -274,12 +311,83 @@ export class WorkflowWorker implements OnModuleInit, OnApplicationShutdown {
               completedAt: new Date(),
             },
           });
-          return true;
+          return {
+            success: true,
+            result: (recovery.result ?? {}) as Record<string, unknown>,
+          };
+        }
+
+        // Non-terminal hint: influence the next attempt.
+        if (recovery.hint) {
+          const previousModel = recoveryHint?.overrideModel ?? (stepConfig.model as string);
+          recoveryHint = { ...recoveryHint, ...recovery.hint };
+          if (recovery.hint.overrideModel && recovery.hint.overrideModel !== previousModel) {
+            this.modelSwitchCounter.inc({
+              tenant: job.tenantId,
+              from_model: previousModel ?? 'unknown',
+              to_model: recovery.hint.overrideModel,
+            });
+            await this.audit.log({
+              tenantId: job.tenantId,
+              jobId: job.id,
+              action: AuditAction.MODEL_SWITCHED,
+              message: `Switching model: ${previousModel ?? 'unknown'} → ${recovery.hint.overrideModel}`,
+              metadata: { attempt, stepType: wfStep.type },
+            });
+          }
         }
       }
     }
 
-    return false;
+    return { success: false };
+  }
+
+  // ── Persistence helpers ───────────────────────────────────────────────────
+
+  private async persistStepSuccess(
+    stepId: string,
+    attempt: number,
+    result: Record<string, unknown> | undefined,
+    telemetry: StepTelemetry | undefined,
+  ): Promise<void> {
+    await this.prisma.jobStep.update({
+      where: { id: stepId },
+      data: {
+        status: StepStatus.COMPLETED,
+        result: (result ?? {}) as Prisma.InputJsonValue,
+        completedAt: new Date(),
+        attempts: attempt,
+        model: telemetry?.model,
+        promptTokens: telemetry?.promptTokens,
+        completionTokens: telemetry?.completionTokens,
+        costUsd: telemetry?.costUsd !== undefined ? new Prisma.Decimal(telemetry.costUsd) : null,
+      },
+    });
+  }
+
+  private recordLlmMetrics(tenantId: string, telemetry: StepTelemetry | undefined): void {
+    if (!telemetry?.model) return;
+    const labels = {
+      tenant: tenantId,
+      provider: telemetry.model.startsWith('claude') ? 'anthropic' :
+                telemetry.model.startsWith('gpt') ? 'openai' : 'mock',
+      model: telemetry.model,
+    };
+    if (telemetry.promptTokens) {
+      this.llmTokensCounter.inc({ ...labels, kind: 'input' }, telemetry.promptTokens);
+    }
+    if (telemetry.completionTokens) {
+      this.llmTokensCounter.inc({ ...labels, kind: 'output' }, telemetry.completionTokens);
+    }
+    if (telemetry.costUsd) this.llmCostCounter.inc(labels, telemetry.costUsd);
+  }
+
+  private async loadJobPayload(jobId: string): Promise<Record<string, unknown> | null> {
+    const row = await this.prisma.job.findUnique({
+      where: { id: jobId },
+      select: { payload: true },
+    });
+    return (row?.payload ?? null) as Record<string, unknown> | null;
   }
 
   // ── Lifecycle helpers ─────────────────────────────────────────────────────

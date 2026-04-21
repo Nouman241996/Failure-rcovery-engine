@@ -36,6 +36,13 @@ const schema = z.object({
 
   // Idempotency
   IDEMPOTENCY_TTL_HOURS: z.coerce.number().int().positive().default(24),
+
+  // AI — providers & defaults
+  OPENAI_API_KEY: z.string().optional(),
+  ANTHROPIC_API_KEY: z.string().optional(),
+  DEFAULT_LLM_PROVIDER: z.enum(['openai', 'anthropic', 'mock']).default('mock'),
+  DEFAULT_LLM_MODEL: z.string().default('mock-small'),
+  TOOL_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
 });
 
 export type AppEnv = z.infer<typeof schema>;
